@@ -1,0 +1,25 @@
+name: 项目质量检查
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m pip install -e beginner/03-todo-cli -e templates/basic-project-template -e templates/standard-project-template -e templates/advanced-project-template
+      - run: python -m taskflow --help
+      - run: python -m ruff check .
+      - run: python -m ruff format --check .
+      - run: python -m pytest
+      - run: python -m pip wheel --no-deps --no-build-isolation --wheel-dir dist beginner/03-todo-cli
