@@ -1,20 +1,161 @@
-# CLI 命令行设计
+# 10 CLI 命令行设计
 
-## 本章目标与前置知识
+## 本章目标
 
-入口组装依赖，分派命令并将数据类转换为可读 JSON。 需要了解 Python 函数、模块和异常。
+argparse 处理语法错误为退出码 2。main 处理可预见业务、存储与路径错误为 1，成功打印 JSON 并返回 0。
 
-## 设计思路、核心代码与解释
+## 前置知识
 
-从[cli.py](../src/taskflow/cli.py)中的 `main` 开始阅读。入口组装依赖，分派命令并将数据类转换为可读 JSON。
-先核对输入与输出，再沿调用处检查异常会交给哪一层处理。
+能够使用 Python 函数、包导入、异常和上下文管理器。先阅读[项目安装与命令](../README.md)，运行最小新增和查询，再学习本章。
 
-## 运行和测试
+## 设计思路
 
-在项目目录安装 `python -m pip install -e .`。按[使用演练](../examples/usage.md)执行相关命令，再运行 `python -m pytest`。检查过程中使用 `--db demo.db` 指定演练数据库。
+argparse 处理语法错误为退出码 2。main 处理可预见业务、存储与路径错误为 1，成功打印 JSON 并返回 0。 本项目对任务创建允许相同标题，使用 ID 区分。持久化时间以 UTC 记录，截止日期按 YYYY-MM-DD 验证。
 
-## 常见问题与总结
+## 核心代码
 
-导入错误时确认已经完成编辑安装；数据不符合预期时先确认环境变量或命令行覆盖后的数据库路径。入口组装依赖，分派命令并将数据类转换为可读 JSON。
+下面摘自当前实际实现 [cli.py](../src/taskflow/cli.py)。
 
-[教程目录](README.md)
+```python
+"""命令解析与可读 JSON 输出。"""
+
+import argparse
+import json
+import logging
+import sqlite3
+import sys
+from dataclasses import asdict
+from pathlib import Path
+
+from .config import Config
+from .database import Database
+from .exceptions import TaskFlowError, ValidationError
+from .exporters import export_csv
+from .models import PRIORITIES, STATUSES
+from .repository import TaskRepository
+from .services import TaskService
+
+
+def parser() -> argparse.ArgumentParser:
+    """构造命令定义，配置选项置于子命令之前。"""
+    root = argparse.ArgumentParser(description="TaskFlow 命令行任务管理")
+    root.add_argument("--db", help="SQLite 路径，覆盖 TASKFLOW_DB")
+    root.add_argument("--verbose", action="store_true", help="记录操作日志")
+    commands = root.add_subparsers(dest="command", required=True)
+    add = commands.add_parser("add", help="新增任务")
+    add.add_argument("title")
+    add.add_argument("--description", default="")
+    add.add_argument("--priority", choices=PRIORITIES, default="normal")
+    add.add_argument("--due-date")
+    listing = commands.add_parser("list", help="列出任务")
+    listing.add_argument("--status", choices=STATUSES)
+    listing.add_argument("--priority", choices=PRIORITIES)
+    listing.add_argument("--due-before", help="包含该日的截止日期上界")
+    for name in ("show", "delete", "complete", "reopen"):
+        commands.add_parser(name).add_argument("id", type=int)
+    update = commands.add_parser("update")
+    update.add_argument("id", type=int)
+    for name in ("title", "description", "due-date"):
+        update.add_argument("--" + name)
+    update.add_argument("--priority", choices=PRIORITIES)
+    update.add_argument("--clear-due-date", action="store_true")
+    commands.add_parser("search").add_argument("keyword")
+    export = commands.add_parser("export")
+    export.add_argument("--output", required=True, type=Path)
+    return root
+
+
+def main(argv: list[str] | None = None) -> int:
+    """把可预见错误变成退出码 1，解析错误由 argparse 返回 2。"""
+    args = parser().parse_args(argv)
+    logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING)
+    try:
+        config = Config.load(args.db)
+        if args.command == "export" and args.output.expanduser().resolve() == config.database:
+            raise ValidationError("导出路径不能与数据库相同")
+        repository = TaskRepository(Database(config.database))
+        service = TaskService(repository)
+        if args.command == "add":
+            result = service.add(args.title, args.description, args.priority, args.due_date)
+        elif args.command == "list":
+            result = repository.list(
+                status=args.status, priority=args.priority, due_before=args.due_before
+            )
+        elif args.command == "show":
+            result = repository.get(args.id)
+        elif args.command == "update":
+            if args.clear_due_date and args.due_date is not None:
+                raise ValidationError("不能同时设置和清除截止日期")
+            changes = {
+                key: getattr(args, key)
+                for key in ("title", "description", "priority", "due_date")
+                if getattr(args, key) is not None
+            }
+            if args.clear_due_date:
+                changes["due_date"] = None
+            if not changes:
+                raise ValidationError("至少提供一个要修改的字段")
+            result = repository.update(args.id, changes)
+        elif args.command in ("complete", "reopen"):
+            result = service.set_completed(args.id, args.command == "complete")
+        elif args.command == "delete":
+            repository.delete(args.id)
+            result = {"deleted": args.id}
+        elif args.command == "search":
+            result = service.search(args.keyword)
+        else:
+            count = export_csv(repository.list(), args.output)
+            result = {"exported": count, "output": str(args.output)}
+        if isinstance(result, list):
+            payload = [asdict(task) for task in result]
+        elif isinstance(result, dict):
+            payload = result
+        else:
+            payload = asdict(result)
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    except (TaskFlowError, sqlite3.Error, OSError) as error:
+        print(f"错误：{error}", file=sys.stderr)
+        return 1
+```
+
+## 代码解释
+
+parser 负责输入契约，main 负责配置、依赖组装、分派和输出。全局选项位于子命令前；任务列表逐项序列化为 JSON。
+
+## 运行方法
+
+在项目目录执行编辑安装：
+
+```bash
+python -m pip install -e .
+python -m taskflow --db demo.db add "学习 Python" --priority high
+python -m taskflow --db demo.db search Python
+```
+
+首次演练从新数据库开始，已有数据库时按实际新增返回的 ID 替换示例中的 1。正常查询打印 JSON；不存在任务打印错误到 stderr 并返回 1。帮助命令不创建数据库。
+
+## 测试方法
+
+安装开发依赖后运行相关测试和完整测试：
+
+```bash
+python -m pip install pytest==9.2.0 ruff==0.11.13
+python -m pytest tests/test_cli.py -q
+python -m pytest -q
+```
+
+核对[实际测试文件](../tests/test_cli.py)的断言。测试数据放在 tmp_path，CLI 测试通过 TASKFLOW_DB 指向临时文件。测试运行结果以关联提交的 CI 为准。
+
+## 常见问题
+
+- 找不到 taskflow 时检查当前解释器是否完成编辑安装。
+- 日期错误时用完整的 YYYY-MM-DD，空标题和大于 200 字的标题也会被拒绝。
+- 数据不一致时检查 --db 与 TASKFLOW_DB，确认调用的是同一数据库。
+- CSV 按文本导入；导出内容保留原文，不对标题自动改写。
+
+## 本章总结
+
+argparse 处理语法错误为退出码 2。main 处理可预见业务、存储与路径错误为 1，成功打印 JSON 并返回 0。 修改时同步验证相关成功、异常和边界场景，再核对实际命令输出。
+
+[教程目录](README.md) · [扩展练习](../exercises/README.md)
